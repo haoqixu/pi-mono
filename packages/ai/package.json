@@ -5,6 +5,10 @@
 	"type": "module",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
+	"browser": {
+		"./dist/runtime.js": "./dist/runtime.browser.js",
+		"./dist/utils/oauth/openai-codex.js": "./dist/utils/oauth/openai-codex.browser.js"
+	},
 	"bin": {
 		"pi-ai": "./dist/cli.js"
 	},
