@@ -11,6 +11,8 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
+	clampThinkingLevel,
+	getSupportedThinkingLevels,
 	type ImageContent,
 	isRetryableAssistantError,
 	type Message,
@@ -141,6 +143,11 @@ import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
+import {
+	type BranchSummaryChoice,
+	type BranchSummaryConfig,
+	BranchSummarySelectorComponent,
+} from "./components/branch-summary-selector.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -5024,6 +5031,7 @@ export class InteractiveMode {
 	 */
 	private showSelector(
 		create: (done: () => void) => { component: Component; focus: Component; dispose?: () => void },
+		blocked?: BlockedStatus,
 	): void {
 		const token = {};
 		let dispose: (() => void) | undefined;
@@ -5037,10 +5045,20 @@ export class InteractiveMode {
 			this.ui.setFocus(this.editor);
 		};
 		const created = create(done);
-		dispose = created.dispose;
+		let disposed = false;
+		dispose = () => {
+			if (disposed) return;
+			disposed = true;
+			try {
+				created.dispose?.();
+			} finally {
+				if (blocked) this.programStatus.setBlocked("selector", undefined);
+			}
+		};
 		this.disposeActiveSelector();
 		this.activeSelectorToken = token;
 		this.activeSelectorDispose = dispose;
+		if (blocked) this.programStatus.setBlocked("selector", blocked);
 		this.editorContainer.clear();
 		this.editorContainer.addChild(created.component);
 		this.ui.setFocus(created.focus);
@@ -5520,6 +5538,130 @@ export class InteractiveMode {
 		});
 	}
 
+	private saveBranchSummaryDefaults(model: Model<string>, thinkingLevel: ThinkingLevel): void {
+		this.settingsManager.setSummarizationConfig("branchSummary", model.provider, model.id, thinkingLevel);
+		this.showStatus("Branch summary defaults saved");
+	}
+
+	private showBranchSummaryPrompt(
+		config: BranchSummaryConfig,
+	): Promise<BranchSummaryChoice | "selectModel" | "dismissed" | undefined> {
+		return new Promise((resolve) => {
+			this.showSelector(
+				(done) => {
+					const finish = (choice: BranchSummaryChoice | "selectModel" | undefined) => {
+						resolve(choice);
+						done();
+					};
+					const selector = new BranchSummarySelectorComponent(
+						config,
+						(action) => {
+							switch (action) {
+								case "selectModel":
+								case "No summary":
+								case "Summarize":
+								case "Summarize with custom prompt":
+									finish(action);
+									return;
+								case "cycleForward":
+								case "cycleBackward": {
+									const available = this.session.modelRuntime.getAvailableSnapshot();
+									const models =
+										this.session.scopedModels.length > 0
+											? this.session.scopedModels.flatMap((scoped) => {
+													const model = available.find(
+														(m) => m.provider === scoped.model.provider && m.id === scoped.model.id,
+													);
+													return model ? [{ model, thinkingLevel: scoped.thinkingLevel }] : [];
+												})
+											: available.map((model) => ({ model, thinkingLevel: undefined }));
+									const index = models.findIndex(
+										({ model }) => model.provider === config.model?.provider && model.id === config.model.id,
+									);
+									const nextIndex =
+										index < 0
+											? action === "cycleForward"
+												? 0
+												: models.length - 1
+											: (index + (action === "cycleForward" ? 1 : -1) + models.length) % models.length;
+									const next = models[nextIndex];
+									if (next) {
+										config.model = next.model;
+										config.thinkingLevel = clampThinkingLevel(
+											next.model,
+											next.thinkingLevel ?? config.thinkingLevel,
+										);
+										config.error = undefined;
+									}
+									break;
+								}
+								case "cycleThinking": {
+									if (config.model) {
+										const levels = getSupportedThinkingLevels(config.model);
+										config.thinkingLevel =
+											levels[(levels.indexOf(config.thinkingLevel) + 1) % levels.length] ?? "off";
+									}
+									break;
+								}
+								case "expandTools":
+									this.toggleToolOutputExpansion();
+									break;
+								case "save":
+									if (config.model) this.saveBranchSummaryDefaults(config.model, config.thinkingLevel);
+									break;
+							}
+							selector.invalidate();
+							this.ui.requestRender();
+						},
+						() => finish(undefined),
+					);
+					return { component: selector, focus: selector, dispose: () => resolve("dismissed") };
+				},
+				{ kind: "question", message: "Summarize branch?" },
+			);
+		});
+	}
+
+	private showBranchSummaryModelSelector(config: BranchSummaryConfig): Promise<boolean> {
+		return new Promise((resolve) => {
+			this.showSelector(
+				(done) => {
+					const finish = (model?: Model<string>, persist = false) => {
+						if (model) {
+							config.model = model;
+							config.thinkingLevel = clampThinkingLevel(model, config.thinkingLevel);
+							config.error = undefined;
+							if (persist) this.saveBranchSummaryDefaults(model, config.thinkingLevel);
+						}
+						resolve(true);
+						done();
+					};
+					const defaults = this.settingsManager.getBranchSummarySettings();
+					const selector = new ModelSelectorComponent(
+						this.ui,
+						config.model,
+						this.session.modelRuntime,
+						this.session.scopedModels,
+						(model) => finish(model),
+						() => finish(),
+						undefined,
+						(model) => finish(model, true),
+						defaults.provider && defaults.model ? { provider: defaults.provider, id: defaults.model } : undefined,
+					);
+					return {
+						component: selector,
+						focus: selector,
+						dispose: () => {
+							selector.dispose();
+							resolve(false);
+						},
+					};
+				},
+				{ kind: "question", message: "Select branch summary model" },
+			);
+		});
+	}
+
 	private showModelsSelector(): void {
 		let availableModels = [...this.session.modelRuntime.getAvailableSnapshot()];
 		let availableModelIds = new Set(availableModels.map((model) => `${model.provider}/${model.id}`));
@@ -5730,15 +5872,23 @@ export class InteractiveMode {
 					// Loop until user makes a complete choice or cancels to tree
 					let wantsSummary = false;
 					let customInstructions: string | undefined;
+					let summaryConfig: BranchSummaryConfig = { thinkingLevel: this.session.thinkingLevel };
 
 					// Check if we should skip the prompt (user preference to always default to no summary)
 					if (!this.settingsManager.getBranchSummarySkipPrompt()) {
+						try {
+							summaryConfig = this.session.resolveBranchSummaryConfig();
+						} catch (error) {
+							// Navigation without a summary and choosing a replacement model remain available.
+							summaryConfig.error = error instanceof Error ? error.message : String(error);
+						}
 						while (true) {
-							const summaryChoice = await this.showExtensionSelector("Summarize branch?", [
-								"No summary",
-								"Summarize",
-								"Summarize with custom prompt",
-							]);
+							const summaryChoice = await this.showBranchSummaryPrompt(summaryConfig);
+							if (summaryChoice === "dismissed") return;
+							if (summaryChoice === "selectModel") {
+								if (!(await this.showBranchSummaryModelSelector(summaryConfig))) return;
+								continue;
+							}
 
 							if (summaryChoice === undefined) {
 								// User pressed escape - re-show tree selector with same selection
@@ -5793,6 +5943,9 @@ export class InteractiveMode {
 						const result = await this.session.navigateTree(entryId, {
 							summarize: wantsSummary,
 							customInstructions,
+							...(wantsSummary && summaryConfig.model
+								? { model: summaryConfig.model, thinkingLevel: summaryConfig.thinkingLevel }
+								: {}),
 						});
 
 						if (result.aborted) {

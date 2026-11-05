@@ -172,6 +172,8 @@ See [`prepareCompaction()`](https://github.com/earendil-works/pi/blob/main/packa
 
 When you use `/tree` to navigate to a different branch, Pi offers to summarize the work you're leaving. This injects context from the left branch into the new branch.
 
+The `/tree` summary prompt lets you choose a model and thinking level for this navigation without changing the conversation or compaction settings. Press `Ctrl+S` to save them as global `branchSummary` defaults; project settings take precedence.
+
 ### How It Works
 
 1. **Find common ancestor**: Deepest node shared by old and new positions

@@ -645,11 +645,28 @@ export class AgentSession {
 		}
 	}
 
+	/** Resolve branch-summary defaults without changing the conversation model or settings. */
+	resolveBranchSummaryConfig(options: { model?: Model<string>; thinkingLevel?: ThinkingLevel } = {}): {
+		model: Model<string>;
+		thinkingLevel: ThinkingLevel;
+	} {
+		const settings = this.settingsManager.getBranchSummarySettings();
+		return this._getSummarizationModel(
+			{
+				provider: options.model ? undefined : settings.provider,
+				model: options.model ? undefined : settings.model,
+				thinkingLevel: options.thinkingLevel ?? settings.thinkingLevel,
+			},
+			options.model ?? this.model,
+			"branchSummary",
+		);
+	}
+
 	private _getSummarizationModel(
 		settings: { provider?: string; model?: string; thinkingLevel?: ThinkingLevel },
-		fallbackModel: Model<any> | undefined,
+		fallbackModel: Model<string> | undefined,
 		settingsKey: "compaction" | "branchSummary",
-	): { model: Model<any>; thinkingLevel: ThinkingLevel } {
+	): { model: Model<string>; thinkingLevel: ThinkingLevel } {
 		const hasModelOverride = settings.provider !== undefined || settings.model !== undefined;
 		const provider = settings.provider ?? fallbackModel?.provider;
 		const modelId = settings.model ?? fallbackModel?.id;
@@ -4129,11 +4146,20 @@ export class AgentSession {
 	 * @param options.customInstructions Custom instructions for summarizer
 	 * @param options.replaceInstructions If true, customInstructions replaces the default prompt
 	 * @param options.label Label to attach to the branch summary entry
+	 * @param options.model One-off summary model; does not change the conversation model or settings
+	 * @param options.thinkingLevel One-off summary thinking level, clamped to the model's capabilities
 	 * @returns Result with editorText (if user message) and cancelled status
 	 */
 	async navigateTree(
 		targetId: string,
-		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
+		options: {
+			summarize?: boolean;
+			customInstructions?: string;
+			replaceInstructions?: boolean;
+			label?: string;
+			model?: Model<string>;
+			thinkingLevel?: ThinkingLevel;
+		} = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.isStreaming || this._promptPreflightCount > 0) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
@@ -4156,6 +4182,7 @@ export class AgentSession {
 		// Model required for summarization
 		if (
 			options.summarize &&
+			!options.model &&
 			!this.model &&
 			branchSummarySettings.provider === undefined &&
 			branchSummarySettings.model === undefined
@@ -4234,11 +4261,7 @@ export class AgentSession {
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const signal = abortController.signal;
-				const { model, thinkingLevel } = this._getSummarizationModel(
-					branchSummarySettings,
-					this.model,
-					"branchSummary",
-				);
+				const { model, thinkingLevel } = this.resolveBranchSummaryConfig(options);
 				const result = await generateBranchSummary(entriesToSummarize, {
 					...(await this._getSummarizationRequestAuth(model, signal, thinkingLevel)),
 					signal,

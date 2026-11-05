@@ -2,6 +2,10 @@ import { Container } from "@earendil-works/pi-tui";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import type {
+	BranchSummaryChoice,
+	BranchSummaryConfig,
+} from "../src/modes/interactive/components/branch-summary-selector.ts";
 import type { StatusIndicator } from "../src/modes/interactive/components/status-indicator.ts";
 import type { TreeSelectorComponent } from "../src/modes/interactive/components/tree-selector.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
@@ -20,6 +24,8 @@ function createTreeUI() {
 		sessionManager,
 		settingsManager: SettingsManager.inMemory(),
 		session: {
+			thinkingLevel: "off" as const,
+			resolveBranchSummaryConfig: vi.fn(() => ({ thinkingLevel: "off" as const })),
 			isStreaming: false,
 			isCompacting: false,
 			abort: vi.fn(async () => {
@@ -42,7 +48,13 @@ function createTreeUI() {
 		) => {
 			selector = create(vi.fn()).component;
 		},
-		showExtensionSelector: vi.fn(async () => "No summary"),
+		showBranchSummaryPrompt: vi.fn(
+			async (_config: BranchSummaryConfig): Promise<BranchSummaryChoice | "selectModel" | "dismissed" | undefined> =>
+				"No summary",
+		),
+		showBranchSummaryModelSelector: vi.fn(async (_config: BranchSummaryConfig) => true),
+		showExtensionEditor: vi.fn(async (): Promise<string | undefined> => undefined),
+		showTreeSelector: vi.fn(),
 		// Dispose newly created indicators so a failing regression cannot leak spinner timers.
 		showStatusIndicator: vi.fn((indicator: StatusIndicator) => indicator.dispose()),
 		clearStatusIndicator: vi.fn(),
@@ -70,30 +82,33 @@ describe("InteractiveMode tree navigation availability", () => {
 	beforeEach(() => initTheme("dark"));
 
 	// Regression for #9178 / PR #9179: rejection must not replace the active operation's UI.
-	it.each(["Summarize", "No summary"])("preserves operation UI when choosing %s while busy", async (choice) => {
-		const { ui, onEscape, select } = createTreeUI();
-		const originalLeafId = ui.sessionManager.getLeafId();
-		ui.showExtensionSelector.mockImplementation(async () => {
-			// Compaction or another navigation can start while the dialog is open.
-			ui.session.isCompacting = true;
-			return choice;
-		});
+	it.each(["Summarize", "No summary"] as const)(
+		"preserves operation UI when choosing %s while busy",
+		async (choice) => {
+			const { ui, onEscape, select } = createTreeUI();
+			const originalLeafId = ui.sessionManager.getLeafId();
+			ui.showBranchSummaryPrompt.mockImplementation(async () => {
+				// Compaction or another navigation can start while the dialog is open.
+				ui.session.isCompacting = true;
+				return choice;
+			});
 
-		await select();
+			await select();
 
-		expect(ui.showError).toHaveBeenCalledWith(busyMessage);
-		expect(ui.showStatusIndicator).not.toHaveBeenCalled();
-		expect(ui.clearStatusIndicator).not.toHaveBeenCalled();
-		expect(ui.defaultEditor.onEscape).toBe(onEscape);
-		expect(ui.session.navigateTree).not.toHaveBeenCalled();
-		expect(ui.session.abort).not.toHaveBeenCalled();
-		expect(ui.sessionManager.getLeafId()).toBe(originalLeafId);
-	});
+			expect(ui.showError).toHaveBeenCalledWith(busyMessage);
+			expect(ui.showStatusIndicator).not.toHaveBeenCalled();
+			expect(ui.clearStatusIndicator).not.toHaveBeenCalled();
+			expect(ui.defaultEditor.onEscape).toBe(onEscape);
+			expect(ui.session.navigateTree).not.toHaveBeenCalled();
+			expect(ui.session.abort).not.toHaveBeenCalled();
+			expect(ui.sessionManager.getLeafId()).toBe(originalLeafId);
+		},
+	);
 
 	it("allows navigation when compaction finishes while the dialog is open", async () => {
 		const { ui, targetId, select } = createTreeUI();
 		ui.session.isCompacting = true;
-		ui.showExtensionSelector.mockImplementation(async () => {
+		ui.showBranchSummaryPrompt.mockImplementation(async () => {
 			ui.session.isCompacting = false;
 			return "No summary";
 		});
@@ -105,6 +120,59 @@ describe("InteractiveMode tree navigation availability", () => {
 			customInstructions: undefined,
 		});
 		expect(ui.showError).not.toHaveBeenCalled();
+	});
+
+	it("returns to the same tree selection on cancel", async () => {
+		const { ui, targetId, select } = createTreeUI();
+		ui.showBranchSummaryPrompt.mockResolvedValue(undefined);
+		await select();
+		expect(ui.showTreeSelector).toHaveBeenCalledWith(targetId);
+		expect(ui.session.navigateTree).not.toHaveBeenCalled();
+	});
+
+	it("does not reopen the tree when the prompt is displaced", async () => {
+		const { ui, select } = createTreeUI();
+		ui.showBranchSummaryPrompt.mockResolvedValue("dismissed");
+		await select();
+		expect(ui.showTreeSelector).not.toHaveBeenCalled();
+		expect(ui.session.navigateTree).not.toHaveBeenCalled();
+	});
+
+	it("keeps local configuration through model selection and cancelled custom instructions", async () => {
+		const { ui, select } = createTreeUI();
+		ui.showBranchSummaryPrompt
+			.mockResolvedValueOnce("selectModel")
+			.mockResolvedValueOnce("Summarize with custom prompt")
+			.mockResolvedValueOnce("No summary");
+		ui.showBranchSummaryModelSelector.mockImplementation(async (config) => {
+			config.thinkingLevel = "high";
+			return true;
+		});
+		await select();
+		const configs = ui.showBranchSummaryPrompt.mock.calls.map(([config]) => config);
+		expect(configs).toHaveLength(3);
+		expect(configs.every((config) => config === configs[0] && config.thinkingLevel === "high")).toBe(true);
+		expect(ui.showExtensionEditor).toHaveBeenCalledOnce();
+		expect(ui.session.navigateTree).toHaveBeenCalledOnce();
+	});
+
+	it("skips configuration resolution when skipPrompt is enabled", async () => {
+		const { ui, select } = createTreeUI();
+		ui.settingsManager.applyOverrides({ branchSummary: { skipPrompt: true } });
+		await select();
+		expect(ui.session.resolveBranchSummaryConfig).not.toHaveBeenCalled();
+		expect(ui.showBranchSummaryPrompt).not.toHaveBeenCalled();
+		expect(ui.session.navigateTree).toHaveBeenCalledOnce();
+	});
+
+	it("keeps navigation available when configured model resolution fails", async () => {
+		const { ui, select } = createTreeUI();
+		ui.session.resolveBranchSummaryConfig.mockImplementation(() => {
+			throw new Error("Invalid model");
+		});
+		await select();
+		expect(ui.showBranchSummaryPrompt).toHaveBeenCalledWith(expect.objectContaining({ error: "Invalid model" }));
+		expect(ui.session.navigateTree).toHaveBeenCalledOnce();
 	});
 
 	it("still aborts an active response before navigating", async () => {
@@ -126,7 +194,7 @@ describe("InteractiveMode tree navigation availability", () => {
 	it("rechecks availability after the response abort settles", async () => {
 		const { ui, onEscape, select } = createTreeUI();
 		ui.session.isStreaming = true;
-		ui.showExtensionSelector.mockResolvedValue("Summarize");
+		ui.showBranchSummaryPrompt.mockResolvedValue("Summarize");
 		ui.session.abort.mockImplementation(async () => {
 			ui.session.isStreaming = false;
 			ui.session.isCompacting = true;
